@@ -1,0 +1,76 @@
+From: Tribuchet contributors
+Subject: [PATCH] external builders: fall back to local build on decline (nix >= 2.36pre)
+
+Variant of external-builders-decline-fallback.patch for Nix master. There,
+`unprepareBuild()` returns the builder status instead of throwing
+BuilderFailureError, and the exit status is handled in an inline
+`if (!statusOk(status))` branch. The pre-2.36 patch still applies to that
+tree (the catch block exists) but hooks a path a declined external builder
+never reaches, so the fallback silently never fires.
+
+
+diff --git a/src/libstore/build/derivation-building-goal.cc b/src/libstore/build/derivation-building-goal.cc
+index 80c8f3d..6577ea7 100644
+--- a/src/libstore/build/derivation-building-goal.cc
++++ b/src/libstore/build/derivation-building-goal.cc
+@@ -27,6 +27,9 @@
+ #include <sys/types.h>
+ #include <fcntl.h>
+ #include <unistd.h>
++#ifndef _WIN32
++#  include <sys/wait.h>
++#endif
+ 
+ #include <nlohmann/json.hpp>
+ 
+@@ -1034,6 +1037,32 @@ Goal::Co DerivationBuildingGoal::buildLocally(
+ 
+     /* Check the exit status. */
+     if (!statusOk(status)) {
++
++        /* External builder declined; build locally if this host can. */
++        if (localBuildCap.externalBuilder && WIFEXITED(status)
++            && WEXITSTATUS(status) == externalBuilderDeclinedExitCode) {
++            bool platformOk = drv->platform == settings.thisSystem.get()
++                              || settings.extraPlatforms.get().count(drv->platform) || drv->isBuiltin();
++            auto required = drvOptions.getRequiredSystemFeatures(*drv);
++            auto & available = worker.store.config.systemFeatures.get();
++            bool featuresOk =
++                std::ranges::all_of(required, [&](const std::string & f) { return available.count(f); });
++            if (worker.settings.maxBuildJobs.get() != 0 && platformOk && featuresOk) {
++                debug(
++                    "external builder declined '%s'; falling back to a local build",
++                    worker.store.printStorePath(drvPath));
++                builder->cleanupBuild(false);
++                builder.reset();
++                localBuildCap.externalBuilder = nullptr;
++                co_return buildLocally(
++                    std::move(localBuildCap),
++                    std::move(inputPaths),
++                    std::move(initialOutputs),
++                    std::move(drvOptions),
++                    std::move(outputLocks));
++            }
++        }
++
+         builder->cleanupBuild(false);
+         builder.reset();
+         outputLocks.unlock();
+diff --git a/src/libstore/include/nix/store/build/derivation-builder.hh b/src/libstore/include/nix/store/build/derivation-builder.hh
+index eedfc0c..2e3b268 100644
+--- a/src/libstore/include/nix/store/build/derivation-builder.hh
++++ b/src/libstore/include/nix/store/build/derivation-builder.hh
+@@ -29,6 +29,13 @@ void rethrowExceptionAsError();
+  */
+ void handleChildException(bool sendException);
+ 
++/**
++ * Exit status with which an external builder declines a build, asking
++ * Nix to build it locally instead (used when no remote worker can serve
++ * the derivation's system).
++ */
++constexpr int externalBuilderDeclinedExitCode = 222;
++
+ /**
+  * Denotes a build failure that stemmed from the builder exiting with a
+  * failing exist status.

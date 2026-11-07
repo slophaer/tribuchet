@@ -233,10 +233,15 @@ in
     (lib.mkIf hub.externalBuilders.enable {
       nix.package =
         let
+          declineFallbackPatch =
+            if lib.versionAtLeast hub.externalBuilders.nixPackage.version "2.36pre" then
+              ./patches/external-builders-decline-fallback-master.patch
+            else
+              ./patches/external-builders-decline-fallback.patch;
           patches =
             lib.optionals hub.externalBuilders.patchNix [
               ./patches/external-builders-uid-range.patch
-              ./patches/external-builders-decline-fallback.patch
+              declineFallbackPatch
             ]
             ++ lib.optional hub.externalBuilders.recursiveNix ./patches/recursive-nix-external-builders.patch;
         in
