@@ -12,6 +12,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Once;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
@@ -234,9 +235,10 @@ async fn attempt_build(
             Some(attach_event::Event::OutputRestart(path)) => {
                 // The previous worker attempt died mid-NAR; the next
                 // attempt streams this output again from the start.
-                if let Some((tx, task)) = unpackers.remove(&path) {
+                if let Some((tx, task, scratch)) = unpackers.remove(&path) {
                     drop(tx);
                     let _ = task.await;
+                    remove_tree(&scratch);
                 }
             }
             Some(attach_event::Event::ExitCode(code)) => {
@@ -284,17 +286,58 @@ fn ready_marker() -> Result<()> {
     res
 }
 
-/// (chunk sender, unpack task) for one in-flight output transfer.
-type Unpacker = (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<Result<()>>);
+/// (chunk sender, unpack task, scratch directory) for one in-flight
+/// output transfer.
+type Unpacker = (
+    mpsc::Sender<Vec<u8>>,
+    tokio::task::JoinHandle<Result<()>>,
+    PathBuf,
+);
+
+/// Serial for scratch directory names, unique within this process.
+static SCRATCH_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 fn remove_tree(path: &Path) {
     let _ = fs::remove_dir_all(path);
     let _ = fs::remove_file(path);
 }
 
-/// Unpack directly into the output path. Nix holds the path lock and
-/// deletes invalid leftovers before the next builder run; a killed
-/// attach leaves nothing behind that Nix does not already clean up.
+/// Scratch directory for one unpack, beside the output so the rename
+/// stays on the same filesystem. The pid separates attach processes and
+/// the counter separates transfers within one.
+fn scratch_path(store_path: &str, serial: u64) -> PathBuf {
+    PathBuf::from(format!(
+        "{store_path}.tribuchet-{}-{serial}",
+        std::process::id()
+    ))
+}
+
+/// Move a finished unpack onto the output path. Nix holds the path
+/// lock and clears an invalid leftover before it runs the builder, so
+/// anything already there is another client that won the race with the
+/// same content: losing is not an error.
+fn commit_output(scratch: &Path, dest: &Path) -> Result<()> {
+    match fs::rename(scratch, dest) {
+        Ok(()) => Ok(()),
+        Err(_) if dest.exists() => {
+            remove_tree(scratch);
+            Ok(())
+        }
+        Err(err) => {
+            remove_tree(scratch);
+            Err(err_ctx(format!("moving output into {}", dest.display()))(
+                err,
+            ))
+        }
+    }
+}
+
+/// Unpack beside the output path and rename it into place. Deduped
+/// requests (`Inflight::by_key`) replay the same NARs to both clients,
+/// which restore into the same directory when they share a store; one
+/// would fail with `File exists`. A private scratch directory plus a
+/// rename keeps that race harmless: first renamer wins, the loser
+/// discards an identical tree.
 async fn handle_output_chunk(
     unpackers: &mut HashMap<String, Unpacker>,
     expected: &[String],
@@ -306,21 +349,25 @@ async fn handle_output_chunk(
             out.store_path
         )));
     }
-    let (tx, _) = unpackers.entry(out.store_path.clone()).or_insert_with(|| {
+    let (tx, _, _) = unpackers.entry(out.store_path.clone()).or_insert_with(|| {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
-        let dest = PathBuf::from(&out.store_path);
+        let scratch = scratch_path(
+            &out.store_path,
+            SCRATCH_SERIAL.fetch_add(1, Ordering::Relaxed),
+        );
         // An earlier attempt in this process may have left a partial
         // tree here; the re-delivered NAR replaces it.
-        remove_tree(&dest);
-        let task =
-            tokio::spawn(
-                async move { nar::unpack_zstd_chunks(rx, &dest).await.map_err(Into::into) },
-            );
-        (tx, task)
+        remove_tree(&scratch);
+        let unpack_into = scratch.clone();
+        let task = tokio::spawn(async move {
+            nar::unpack_zstd_chunks(rx, &unpack_into).await?;
+            Ok(())
+        });
+        (tx, task, scratch)
     });
     if !out.zstd_nar_chunk.is_empty() && tx.send(out.zstd_nar_chunk).await.is_err() {
         // The unpacker only stops early on error; report that error.
-        let (_, task) = unpackers.remove(&out.store_path).unwrap();
+        let (_, task, _) = unpackers.remove(&out.store_path).unwrap();
         let err = task
             .await?
             .err()
@@ -328,9 +375,10 @@ async fn handle_output_chunk(
         return Err(err_ctx(format!("unpacking output {}", out.store_path))(err));
     }
     if out.eof {
-        let (tx, task) = unpackers.remove(&out.store_path).unwrap();
+        let (tx, task, scratch) = unpackers.remove(&out.store_path).unwrap();
         drop(tx);
         task.await??;
+        commit_output(&scratch, &PathBuf::from(&out.store_path))?;
         tracing::debug!(path = out.store_path, "output unpacked");
     }
     Ok(())
@@ -345,12 +393,13 @@ fn write_result_json(top_tmp_dir: &Path, added: &BTreeSet<String>) -> Result<()>
         .map_err(err_ctx(format!("writing {}", path.display())))
 }
 
-/// Stop in-flight unpackers; partial trees stay at the output paths
-/// and are removed before the next unpack of the same path.
+/// Stop in-flight unpackers and drop their scratch directories; a
+/// partial tree never reaches the output path.
 async fn cleanup_unpackers(unpackers: &mut HashMap<String, Unpacker>) {
-    for (_, (tx, task)) in unpackers.drain() {
+    for (_, (tx, task, scratch)) in unpackers.drain() {
         drop(tx);
         let _ = task.await;
+        remove_tree(&scratch);
     }
 }
 
@@ -394,21 +443,74 @@ mod tests {
         .await
     }
 
-    /// Regression: a leftover tree at the output path (earlier attempt in
-    /// this process) must be replaced, not fail with EEXIST.
+    fn scratch_leftovers(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(".tribuchet-"))
+            .collect()
+    }
+
+    /// The output lands at its path and the scratch directory is gone.
     #[tokio::test]
-    async fn replaces_existing_output_path() {
+    async fn unpacks_output_and_leaves_no_scratch() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("out");
         let out_str = out.to_string_lossy().into_owned();
-        fs::create_dir(&out).unwrap();
-        fs::write(out.join("stale"), b"junk").unwrap();
 
         let chunk = zstd_nar_of_file(dir.path(), b"fresh");
         let mut unpackers = HashMap::default();
         deliver(&mut unpackers, &out_str, chunk).await.unwrap();
 
         assert!(unpackers.is_empty());
+        assert_eq!(fs::read(&out).unwrap(), b"fresh");
+        assert_eq!(scratch_leftovers(dir.path()), Vec::<PathBuf>::new());
+    }
+
+    /// Regression: a directory output already in place belongs to a
+    /// client that won the race. Renaming onto it fails with EEXIST,
+    /// which must not fail the build; the scratch is dropped instead.
+    #[tokio::test]
+    async fn keeps_a_directory_output_another_client_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("tree");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("file"), b"fresh").unwrap();
+        let nar = nar::pack::to_vec(&src).unwrap();
+        let chunk = zstd::encode_all(&nar[..], 3).unwrap();
+
+        let out = dir.path().join("out");
+        let out_str = out.to_string_lossy().into_owned();
+        fs::create_dir(&out).unwrap();
+        fs::write(out.join("file"), b"winner").unwrap();
+
+        let mut unpackers = HashMap::default();
+        deliver(&mut unpackers, &out_str, chunk).await.unwrap();
+
+        assert_eq!(fs::read(out.join("file")).unwrap(), b"winner");
+        assert_eq!(scratch_leftovers(dir.path()), Vec::<PathBuf>::new());
+    }
+
+    /// Regression: a request that dedupes onto an in-flight one is
+    /// replayed, so two clients sharing a store receive the same output
+    /// and unpack it at the same time. Neither may fail with EEXIST.
+    #[tokio::test]
+    async fn concurrent_clients_unpack_the_same_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let out_str = out.to_string_lossy().into_owned();
+        let chunk = zstd_nar_of_file(dir.path(), b"fresh");
+
+        let mut first = HashMap::default();
+        let mut second = HashMap::default();
+        let (a, b) = tokio::join!(
+            deliver(&mut first, &out_str, chunk.clone()),
+            deliver(&mut second, &out_str, chunk),
+        );
+        a.unwrap();
+        b.unwrap();
+
         assert_eq!(fs::read(&out).unwrap(), b"fresh");
     }
 }
