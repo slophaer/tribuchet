@@ -5,6 +5,7 @@
 //! Linux the serialized sandbox spec the agent runs the setup stage
 //! with.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -131,7 +132,7 @@ impl ActiveBuild {
             build_id: a.build_id.clone(),
             builder: a.builder.clone(),
             args: a.args.clone(),
-            env: a.env.clone().into_iter().collect(),
+            env: self.builder_env(),
             tmp_dir_in_sandbox: a.tmp_dir_in_sandbox.clone(),
             profile,
             sandbox_json,
@@ -196,6 +197,15 @@ impl ActiveBuild {
         log_done.store(true, Ordering::Relaxed);
         let _ = tailer.join();
         Ok(fin)
+    }
+
+    /// The builder's environment. NIX_BUILD_CORES arrives from the
+    /// hub's Nix, which sized it for the hub; a worker is a different
+    /// machine, usually a much larger one, so answer for ourselves.
+    fn builder_env(&self) -> HashMap<String, String> {
+        let mut env: HashMap<String, String> = self.assignment.env.clone().into_iter().collect();
+        env.insert("NIX_BUILD_CORES".into(), self.ctx.build_cores.to_string());
+        env
     }
 
     /// The Linux sandbox spec sent with the StartRequest. The agent
