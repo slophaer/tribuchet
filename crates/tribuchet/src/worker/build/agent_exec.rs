@@ -21,6 +21,7 @@ use crate::errors::{Result, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::proto::WorkerMessage;
 use crate::tmpdir::pack_zstd_dir;
+use crate::worker::BuildAssignment;
 #[cfg(target_os = "linux")]
 use crate::worker::caps::requires_uid_range;
 #[cfg(target_os = "macos")]
@@ -132,7 +133,7 @@ impl ActiveBuild {
             build_id: a.build_id.clone(),
             builder: a.builder.clone(),
             args: a.args.clone(),
-            env: self.builder_env(),
+            env: builder_env(&self.assignment, self.ctx.build_cores),
             tmp_dir_in_sandbox: a.tmp_dir_in_sandbox.clone(),
             profile,
             sandbox_json,
@@ -199,15 +200,6 @@ impl ActiveBuild {
         Ok(fin)
     }
 
-    /// The builder's environment. NIX_BUILD_CORES arrives from the
-    /// hub's Nix, which sized it for the hub; a worker is a different
-    /// machine, usually a much larger one, so answer for ourselves.
-    fn builder_env(&self) -> HashMap<String, String> {
-        let mut env: HashMap<String, String> = self.assignment.env.clone().into_iter().collect();
-        env.insert("NIX_BUILD_CORES".into(), self.ctx.build_cores.to_string());
-        env
-    }
-
     /// The Linux sandbox spec sent with the StartRequest. The agent
     /// fills in its scratch paths, user namespace and uid block before
     /// spawning the setup stage with it.
@@ -224,7 +216,7 @@ impl ActiveBuild {
     fn build_spec(&self) -> Result<sandbox::SandboxSpec> {
         let a = &self.assignment;
         let uid_count = if requires_uid_range(a) { 65536 } else { 1 };
-        let spec = sandbox::prepare(
+        let mut spec = sandbox::prepare(
             a,
             &self.dir,
             &self.input_list(),
@@ -240,6 +232,9 @@ impl ActiveBuild {
                 nix_daemon_socket: None,
             },
         )?;
+        // The sandbox takes the derivation env from the assignment; the
+        // builder inside it gets this one, not the StartRequest's.
+        spec.env = builder_env(a, self.ctx.build_cores);
         tracing::info!(
             id = a.build_id,
             fixed_output = a.fixed_output,
@@ -336,5 +331,31 @@ pub(in crate::worker) fn supervise_agent(
         extras,
         dir,
         finished_at: Instant::now(),
+    }
+}
+
+/// The builder's environment. NIX_BUILD_CORES arrives from the hub's
+/// Nix, which sized it for the hub; a worker is a different machine,
+/// usually a much larger one, so answer for ourselves. Both the plain
+/// and the sandboxed spawn take the env from here: the sandbox builds
+/// the builder's env from its own spec, not from the StartRequest.
+fn builder_env(a: &BuildAssignment, cores: u32) -> HashMap<String, String> {
+    let mut env: HashMap<String, String> = a.env.clone().into_iter().collect();
+    env.insert("NIX_BUILD_CORES".into(), cores.to_string());
+    env
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_env_answers_with_our_own_cores() {
+        let mut a = BuildAssignment::default();
+        a.env.insert("NIX_BUILD_CORES".into(), "4".into());
+        a.env.insert("PATH".into(), "/bin".into());
+        let env = builder_env(&a, 48);
+        assert_eq!(env.get("NIX_BUILD_CORES").map(String::as_str), Some("48"));
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
     }
 }
