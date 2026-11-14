@@ -25,6 +25,13 @@ let
     strictDeps = true;
     nativeBuildInputs = [ protobuf ];
     PROTOC = "${protobuf}/bin/protoc";
+    # crane otherwise fetches git dependencies with builtins.fetchGit, so every
+    # evaluation of this package needs GitHub to answer; with a hash they are
+    # fixed-output fetches at build time, and substitutable
+    outputHashes = {
+      "git+https://github.com/nix-community/harmonia?rev=10a2228f94956fb568dfc799a1c918484bf33653#10a2228f94956fb568dfc799a1c918484bf33653" =
+        "sha256-mtjErdV07whLMBwGpLNBTJVjhJQdAERwjIwCAltiNpo=";
+    };
   };
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
