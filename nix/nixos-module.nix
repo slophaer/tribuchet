@@ -300,6 +300,13 @@ in
       };
       environment.etc."tribuchet/hub.toml".source = hubToml;
       systemd.services.tribuchet-hub = {
+        # the socket owns the listeners. Started without it, the service binds
+        # them itself and systemd then refuses the socket ("service already
+        # active"): a deploy that changes both fails. Tie them, so the socket
+        # is up first and a restart of it takes the service along.
+        requires = [ "tribuchet-hub.socket" ];
+        after = [ "tribuchet-hub.socket" ];
+        partOf = [ "tribuchet-hub.socket" ];
         wantedBy = [ "multi-user.target" ];
         restartTriggers = [ hubToml ];
         serviceConfig = {
